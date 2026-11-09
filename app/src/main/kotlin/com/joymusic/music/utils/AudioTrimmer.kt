@@ -1,0 +1,684 @@
+/**
+ * JOY MUSIC Project (C) 2026
+ * Licensed under GPL-3.0 | See git history for contributors
+ */
+
+package com.joymusic.music.utils
+
+import android.content.Context
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMuxer
+import android.net.ConnectivityManager
+import android.os.Build
+import androidx.core.content.getSystemService
+import com.joymusic.innertube.YouTube
+import com.joymusic.music.constants.AudioQuality
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import timber.log.Timber
+import java.io.File
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.util.concurrent.TimeUnit
+
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.cache.Cache
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.core.net.toUri
+
+object AudioTrimmer {
+    private const val TAG = "AudioTrimmer"
+
+    val httpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .proxy(YouTube.proxy)
+            .proxyAuthenticator { _, response ->
+                YouTube.proxyAuth?.let { auth ->
+                    response.request.newBuilder()
+                        .header("Proxy-Authorization", auth)
+                        .build()
+                } ?: response.request
+            }
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .callTimeout(60, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+    }
+
+    private fun tryExtractFromCache(
+        cache: Cache?,
+        key: String,
+        destinationFile: File,
+    ): Boolean {
+        if (cache == null) return false
+        val cachedSpans = try { cache.getCachedSpans(key) } catch (_: Exception) { emptySet() }
+        if (cachedSpans.isEmpty()) return false
+
+        val totalCached = cachedSpans.sumOf { it.length }
+        if (totalCached < 50_000L) return false
+
+        try {
+            val cacheDataSource = CacheDataSource.Factory()
+                .setCache(cache)
+                .setUpstreamDataSourceFactory(null)
+                .createDataSource()
+
+            val dataSpec = DataSpec.Builder()
+                .setUri(key.toUri())
+                .setKey(key)
+                .build()
+
+            cacheDataSource.open(dataSpec)
+            destinationFile.outputStream().use { output ->
+                val buffer = ByteArray(64 * 1024)
+                var bytesRead: Int
+                while (true) {
+                    bytesRead = cacheDataSource.read(buffer, 0, buffer.size)
+                    if (bytesRead <= 0) break
+                    output.write(buffer, 0, bytesRead)
+                }
+                output.flush()
+            }
+            cacheDataSource.close()
+            return destinationFile.length() > 50_000L
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "Could not extract directly from cache for key: %s", key)
+            destinationFile.delete()
+            return false
+        }
+    }
+
+    private fun downloadFastWithRanges(
+        streamUrl: String,
+        headers: Map<String, String>,
+        contentLength: Long?,
+        destinationFile: File,
+    ) {
+        val totalBytes = contentLength ?: run {
+            val probeReq = Request.Builder()
+                .url(streamUrl)
+                .header("Range", "bytes=0-0")
+                .apply { headers.forEach { (k, v) -> header(k, v) } }
+                .build()
+            httpClient.newCall(probeReq).execute().use { res ->
+                val rangeHeader = res.header("Content-Range")
+                rangeHeader?.substringAfterLast('/')?.trim()?.toLongOrNull()
+            }
+        }
+
+        if (totalBytes != null && totalBytes > 100_000L) {
+            val chunkSize = 1024 * 1024L // 1MB unthrottled chunks
+            destinationFile.outputStream().use { output ->
+                var start = 0L
+                while (start < totalBytes) {
+                    val end = minOf(start + chunkSize - 1L, totalBytes - 1L)
+                    val chunkReq = Request.Builder()
+                        .url(streamUrl)
+                        .header("Range", "bytes=$start-$end")
+                        .apply { headers.forEach { (k, v) -> header(k, v) } }
+                        .build()
+
+                    httpClient.newCall(chunkReq).execute().use { response ->
+                        if (!response.isSuccessful && response.code != 206) {
+                            throw IOException("HTTP ${response.code} downloading chunk $start-$end")
+                        }
+                        val body = response.body ?: throw IOException("Empty chunk body")
+                        body.byteStream().use { input ->
+                            val buffer = ByteArray(64 * 1024)
+                            var read: Int
+                            while (input.read(buffer).also { read = it } != -1) {
+                                output.write(buffer, 0, read)
+                            }
+                        }
+                    }
+                    start = end + 1L
+                }
+                output.flush()
+            }
+        } else {
+            val req = Request.Builder()
+                .url(streamUrl)
+                .apply { headers.forEach { (k, v) -> header(k, v) } }
+                .build()
+            httpClient.newCall(req).execute().use { res ->
+                if (!res.isSuccessful) throw IOException("HTTP ${res.code}")
+                res.body?.byteStream()?.use { input ->
+                    destinationFile.outputStream().use { output ->
+                        input.copyTo(output, 64 * 1024)
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun getOrDownloadSourceAudio(
+        context: Context,
+        songId: String,
+        downloadCache: Cache? = null,
+        playerCache: Cache? = null,
+    ): File = withContext(Dispatchers.IO) {
+        val tempSourceDir = File(context.cacheDir, "source_audio").apply { mkdirs() }
+        val cachedSource = File(tempSourceDir, "source_$songId.m4a")
+        val oldCachedSource = File(tempSourceDir, "source_$songId.tmp")
+        if (oldCachedSource.exists() && oldCachedSource.length() > 50_000L && !cachedSource.exists()) {
+            oldCachedSource.renameTo(cachedSource)
+        }
+
+        if (cachedSource.exists() && cachedSource.length() > 50_000L) {
+            Timber.tag(TAG).d("Using existing cached source for $songId (${cachedSource.length()} bytes)")
+            return@withContext cachedSource
+        }
+
+        // 1. Try local cache extraction (0ms network)
+        if (tryExtractFromCache(downloadCache, songId, cachedSource)) {
+            Timber.tag(TAG).d("Extracted $songId from downloadCache")
+            return@withContext cachedSource
+        }
+        if (tryExtractFromCache(playerCache, songId, cachedSource)) {
+            Timber.tag(TAG).d("Extracted $songId from playerCache")
+            return@withContext cachedSource
+        }
+
+        // 2. High-speed unthrottled range download from network
+        val connectivityManager = context.getSystemService<ConnectivityManager>()
+            ?: throw IllegalStateException("ConnectivityManager unavailable")
+
+        Timber.tag(TAG).d("Fetching player response for $songId")
+        val playbackData = InnerTubeXPlayer.playerResponseForPlayback(
+            videoId = songId,
+            audioQuality = AudioQuality.HIGH,
+            connectivityManager = connectivityManager,
+        ).getOrThrow()
+
+        val tempDownload = File(tempSourceDir, "source_${songId}_dl_${System.currentTimeMillis()}.m4a")
+        if (tempDownload.exists()) tempDownload.delete()
+
+        try {
+            Timber.tag(TAG).d("Downloading fast chunked stream for %s", songId)
+            downloadFastWithRanges(
+                streamUrl = playbackData.streamUrl,
+                headers = playbackData.streamHeaders,
+                contentLength = playbackData.format.contentLength,
+                destinationFile = tempDownload,
+            )
+
+            if (tempDownload.length() > 50_000L) {
+                if (cachedSource.exists()) cachedSource.delete()
+                tempDownload.renameTo(cachedSource)
+            } else {
+                throw IOException("Downloaded stream file is incomplete or too small")
+            }
+        } finally {
+            if (tempDownload.exists()) {
+                tempDownload.delete()
+            }
+        }
+
+        Timber.tag(TAG).d("Source audio ready: %s (%d bytes)", cachedSource.absolutePath, cachedSource.length())
+        cachedSource
+    }
+
+    suspend fun trimAudio(
+        context: Context,
+        songId: String,
+        title: String,
+        artist: String,
+        startMs: Long,
+        endMs: Long,
+        downloadCache: Cache? = null,
+        playerCache: Cache? = null,
+    ): Result<File> = withContext(Dispatchers.IO) {
+        runCatching {
+            require(endMs > startMs) { "End time must be greater than start time" }
+
+            val sourceFile = getOrDownloadSourceAudio(context, songId, downloadCache, playerCache)
+
+            val clipsDir = File(context.cacheDir, "audio_clips").apply { mkdirs() }
+
+            // Clean up old clips older than 1 hour
+            clipsDir.listFiles()?.filter {
+                System.currentTimeMillis() - it.lastModified() > 3600_000L
+            }?.forEach { it.delete() }
+
+            val sanitizedTitle = title.replace(Regex("[^a-zA-Z0-9._ -]"), "_").take(40).trim()
+            val sanitizedArtist = artist.replace(Regex("[^a-zA-Z0-9._ -]"), "_").take(30).trim()
+
+            val extractor = MediaExtractor()
+            try {
+                extractor.setDataSource(sourceFile.absolutePath)
+
+                var audioTrackIndex = -1
+                var audioFormat: MediaFormat? = null
+
+                for (i in 0 until extractor.trackCount) {
+                    val format = extractor.getTrackFormat(i)
+                    val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+                    if (mime.startsWith("audio/")) {
+                        audioTrackIndex = i
+                        audioFormat = format
+                        break
+                    }
+                }
+
+                if (audioTrackIndex < 0 || audioFormat == null) {
+                    throw IllegalStateException("No audio track found in media file")
+                }
+
+                val mime = audioFormat.getString(MediaFormat.KEY_MIME) ?: ""
+                val isOpusOrWebm = mime.contains("opus", ignoreCase = true) || mime.contains("webm", ignoreCase = true)
+
+                val (muxerOutputFormat, extension) = when {
+                    isOpusOrWebm && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
+                        Pair(MediaMuxer.OutputFormat.MUXER_OUTPUT_OGG, "ogg")
+                    }
+                    isOpusOrWebm && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP -> {
+                        // On Android 9 (API 28) and below, MUXER_OUTPUT_WEBM with Opus audio often fails; use AAC transcode
+                        Pair(MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4, "m4a")
+                    }
+                    else -> {
+                        Pair(MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4, "m4a")
+                    }
+                }
+
+                val clipFileName = if (sanitizedArtist.isNotEmpty()) {
+                    "$sanitizedTitle - $sanitizedArtist (Clip).$extension"
+                } else {
+                    "$sanitizedTitle (Clip).$extension"
+                }
+
+                val outputFile = File(clipsDir, clipFileName)
+                if (outputFile.exists()) outputFile.delete()
+
+                // If Opus/WebM on Android 9 (or if standard muxer fails), use direct universal AAC transcoding
+                if (isOpusOrWebm && Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                    val success = trimAndTranscodeToAac(sourceFile, outputFile, startMs, endMs)
+                    if (success && outputFile.exists() && outputFile.length() > 1000L) {
+                        return@runCatching outputFile
+                    }
+                }
+
+                try {
+                    val muxer = MediaMuxer(outputFile.absolutePath, muxerOutputFormat)
+                    val muxerTrackIndex = muxer.addTrack(audioFormat)
+                    muxer.start()
+
+                    extractor.selectTrack(audioTrackIndex)
+                    val startUs = startMs * 1000L
+                    val endUs = endMs * 1000L
+
+                    extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+
+                    val maxBufferSize = if (audioFormat.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                        audioFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
+                    } else {
+                        512 * 1024
+                    }.coerceAtLeast(256 * 1024)
+
+                    val buffer = ByteBuffer.allocateDirect(maxBufferSize)
+                    val bufferInfo = MediaCodec.BufferInfo()
+                    var firstSampleTimeUs = -1L
+
+                    try {
+                        while (true) {
+                            bufferInfo.offset = 0
+                            bufferInfo.size = extractor.readSampleData(buffer, 0)
+                            if (bufferInfo.size < 0) {
+                                break
+                            }
+
+                            val sampleTimeUs = extractor.sampleTime
+                            if (sampleTimeUs > endUs) {
+                                break
+                            }
+
+                            if (sampleTimeUs >= startUs) {
+                                if (firstSampleTimeUs < 0) {
+                                    firstSampleTimeUs = sampleTimeUs
+                                }
+                                bufferInfo.presentationTimeUs = (sampleTimeUs - firstSampleTimeUs).coerceAtLeast(0L)
+                                bufferInfo.flags = extractor.sampleFlags
+                                muxer.writeSampleData(muxerTrackIndex, buffer, bufferInfo)
+                            }
+
+                            extractor.advance()
+                        }
+                    } finally {
+                        try {
+                            muxer.stop()
+                        } catch (e: Exception) {
+                            Timber.tag(TAG).e(e, "Error stopping muxer")
+                        }
+                        muxer.release()
+                    }
+
+                    outputFile
+                } catch (e: Exception) {
+                    Timber.tag(TAG).w(e, "Standard muxing failed, falling back to universal AAC transcode")
+                    if (outputFile.exists()) outputFile.delete()
+                    val aacFallbackFile = File(clipsDir, "$sanitizedTitle - $sanitizedArtist (Clip).m4a")
+                    val success = trimAndTranscodeToAac(sourceFile, aacFallbackFile, startMs, endMs)
+                    if (success && aacFallbackFile.exists() && aacFallbackFile.length() > 1000L) {
+                        aacFallbackFile
+                    } else {
+                        throw e
+                    }
+                }
+            } finally {
+                extractor.release()
+            }
+        }
+    }
+
+    /**
+     * Universal audio trimming & transcoding to standard AAC LC (.m4a).
+     * Works on all Android versions (Android 5.0 through Android 15+) without OEM codec incompatibilities.
+     */
+    fun trimAndTranscodeToAac(
+        sourceFile: File,
+        outputAacFile: File,
+        startMs: Long = 0L,
+        endMs: Long = Long.MAX_VALUE,
+    ): Boolean {
+        val extractor = MediaExtractor()
+        var decoder: MediaCodec? = null
+        var encoder: MediaCodec? = null
+        var muxer: MediaMuxer? = null
+        var isMuxerStarted = false
+
+        return try {
+            extractor.setDataSource(sourceFile.absolutePath)
+            var audioTrack = -1
+            var inputFormat: MediaFormat? = null
+
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+                if (mime.startsWith("audio/")) {
+                    audioTrack = i
+                    inputFormat = format
+                    extractor.selectTrack(i)
+                    break
+                }
+            }
+
+            if (audioTrack < 0 || inputFormat == null) {
+                return false
+            }
+
+            val startUs = startMs * 1000L
+            val endUs = if (endMs == Long.MAX_VALUE) Long.MAX_VALUE else endMs * 1000L
+            if (startUs > 0) {
+                extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            }
+
+            val inputMime = inputFormat.getString(MediaFormat.KEY_MIME) ?: ""
+            val sampleRate = if (inputFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                inputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            } else 44100
+            val channelCount = if (inputFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+            } else 2
+
+            decoder = MediaCodec.createDecoderByType(inputMime).apply {
+                configure(inputFormat, null, null, 0)
+                start()
+            }
+
+            val aacFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channelCount).apply {
+                setInteger(MediaFormat.KEY_AAC_PROFILE, android.media.MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                setInteger(MediaFormat.KEY_BIT_RATE, 160_000)
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 64 * 1024)
+            }
+
+            encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
+                configure(aacFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                start()
+            }
+
+            if (outputAacFile.exists()) outputAacFile.delete()
+            muxer = MediaMuxer(outputAacFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            var aacTrackIndex = -1
+
+            val decodeInfo = MediaCodec.BufferInfo()
+            val encodeInfo = MediaCodec.BufferInfo()
+
+            var isExtractorEOS = false
+            var isDecoderEOS = false
+            var isEncoderEOS = false
+            var firstPcmPresentationTimeUs = -1L
+
+            while (!isEncoderEOS) {
+                // 1. Feed Extractor to Decoder
+                if (!isExtractorEOS) {
+                    val inIdx = decoder.dequeueInputBuffer(5000L)
+                    if (inIdx >= 0) {
+                        val inBuf = decoder.getInputBuffer(inIdx)
+                        if (inBuf != null) {
+                            val size = extractor.readSampleData(inBuf, 0)
+                            val sampleTime = extractor.sampleTime
+                            if (size < 0 || (endUs != Long.MAX_VALUE && sampleTime > endUs)) {
+                                decoder.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                isExtractorEOS = true
+                            } else {
+                                decoder.queueInputBuffer(inIdx, 0, size, sampleTime, 0)
+                                extractor.advance()
+                            }
+                        }
+                    }
+                }
+
+                // 2. Feed Decoder to Encoder
+                if (!isDecoderEOS) {
+                    val outIdx = decoder.dequeueOutputBuffer(decodeInfo, 5000L)
+                    if (outIdx >= 0) {
+                        val pcmBuf = decoder.getOutputBuffer(outIdx)
+                        if ((decodeInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                            isDecoderEOS = true
+                        }
+
+                        if (decodeInfo.size > 0 && pcmBuf != null) {
+                            val pcmTime = decodeInfo.presentationTimeUs
+                            // Only include PCM samples within [startUs, endUs]
+                            if (pcmTime >= startUs && pcmTime <= endUs) {
+                                if (firstPcmPresentationTimeUs < 0) {
+                                    firstPcmPresentationTimeUs = pcmTime
+                                }
+                                val adjustedPts = (pcmTime - firstPcmPresentationTimeUs).coerceAtLeast(0L)
+
+                                var pcmOffset = decodeInfo.offset
+                                var pcmRemaining = decodeInfo.size
+
+                                while (pcmRemaining > 0) {
+                                    val encInIdx = encoder.dequeueInputBuffer(5000L)
+                                    if (encInIdx >= 0) {
+                                        val encInBuf = encoder.getInputBuffer(encInIdx)
+                                        if (encInBuf != null) {
+                                            encInBuf.clear()
+                                            val chunkSize = minOf(pcmRemaining, encInBuf.capacity())
+                                            pcmBuf.position(pcmOffset)
+                                            pcmBuf.limit(pcmOffset + chunkSize)
+                                            encInBuf.put(pcmBuf)
+
+                                            pcmOffset += chunkSize
+                                            pcmRemaining -= chunkSize
+
+                                            val flags = if (isDecoderEOS && pcmRemaining == 0) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
+                                            encoder.queueInputBuffer(encInIdx, 0, chunkSize, adjustedPts, flags)
+                                        }
+                                    } else {
+                                        break
+                                    }
+                                }
+                            }
+                        } else if (isDecoderEOS) {
+                            val encInIdx = encoder.dequeueInputBuffer(5000L)
+                            if (encInIdx >= 0) {
+                                encoder.queueInputBuffer(encInIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            }
+                        }
+                        decoder.releaseOutputBuffer(outIdx, false)
+                    }
+                }
+
+                // 3. Drain Encoder to Muxer
+                while (true) {
+                    val encOutIdx = encoder.dequeueOutputBuffer(encodeInfo, 5000L)
+                    if (encOutIdx == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                        break
+                    } else if (encOutIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        if (!isMuxerStarted) {
+                            aacTrackIndex = muxer.addTrack(encoder.outputFormat)
+                            muxer.start()
+                            isMuxerStarted = true
+                        }
+                    } else if (encOutIdx >= 0) {
+                        val aacBuf = encoder.getOutputBuffer(encOutIdx)
+                        if (aacBuf != null && encodeInfo.size > 0 && isMuxerStarted) {
+                            aacBuf.position(encodeInfo.offset)
+                            aacBuf.limit(encodeInfo.offset + encodeInfo.size)
+                            muxer.writeSampleData(aacTrackIndex, aacBuf, encodeInfo)
+                        }
+                        encoder.releaseOutputBuffer(encOutIdx, false)
+                        if ((encodeInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                            isEncoderEOS = true
+                            break
+                        }
+                    }
+                }
+            }
+            true
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Error transcoding audio to AAC")
+            false
+        } finally {
+            try { decoder?.stop() } catch (_: Exception) {}
+            decoder?.release()
+            try { encoder?.stop() } catch (_: Exception) {}
+            encoder?.release()
+            if (isMuxerStarted) {
+                try { muxer?.stop() } catch (_: Exception) {}
+            }
+            muxer?.release()
+            extractor.release()
+        }
+    }
+
+    /**
+     * Saves the full song to user's device storage as standard .m4a / AAC audio.
+     * Automatically registers with Android MediaStore / MediaScanner so other music players and file manager see it.
+     */
+    suspend fun saveFullSongToDevice(
+        context: Context,
+        songId: String,
+        title: String,
+        artist: String,
+        thumbnailUrl: String?,
+        playerCache: Cache?,
+        downloadCache: Cache?,
+    ): Result<android.net.Uri> = withContext(Dispatchers.IO) {
+        runCatching {
+            val sanitizedTitle = title.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+            val sanitizedArtist = artist.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+            val fileName = "$sanitizedTitle - $sanitizedArtist.m4a"
+
+            val tempDir = File(context.cacheDir, "exports").apply { if (!exists()) mkdirs() }
+            val tempSourceFile = File(tempDir, "temp_src_${System.currentTimeMillis()}.dat")
+            val tempOutputFile = File(tempDir, "temp_out_${System.currentTimeMillis()}.m4a")
+
+            try {
+                // 1. Try extracting from local download cache or player cache
+                var extracted = tryExtractFromCache(downloadCache, songId, tempSourceFile)
+                if (!extracted) {
+                    extracted = tryExtractFromCache(playerCache, songId, tempSourceFile)
+                }
+
+                // 2. If not cached, download unthrottled with range downloader
+                if (!extracted) {
+                    val connectivityManager = context.getSystemService<ConnectivityManager>()
+                        ?: error("ConnectivityManager unavailable")
+                    val playbackData = InnerTubeXPlayer.playerResponseForPlayback(
+                        videoId = songId,
+                        audioQuality = AudioQuality.HIGH,
+                        connectivityManager = connectivityManager,
+                    ).getOrThrow()
+
+                    downloadFastWithRanges(
+                        streamUrl = playbackData.streamUrl,
+                        headers = playbackData.streamHeaders,
+                        contentLength = playbackData.format.contentLength,
+                        destinationFile = tempSourceFile,
+                    )
+                    if (!tempSourceFile.exists() || tempSourceFile.length() < 1000L) {
+                        throw IOException("Failed to download audio stream")
+                    }
+                }
+
+                // 3. Transcode/mux to standard .m4a container
+                val success = trimAndTranscodeToAac(
+                    sourceFile = tempSourceFile,
+                    outputAacFile = tempOutputFile,
+                    startMs = 0L,
+                    endMs = Long.MAX_VALUE,
+                )
+
+                val finalFile = if (success && tempOutputFile.exists() && tempOutputFile.length() > 1000L) {
+                    tempOutputFile
+                } else if (tempSourceFile.length() > 1000L) {
+                    tempSourceFile
+                } else {
+                    throw IOException("Failed to transcode audio")
+                }
+
+                // 4. Save to Public MediaStore / Music folder
+                val resultUri: android.net.Uri
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val contentValues = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.Audio.Media.DISPLAY_NAME, fileName)
+                        put(android.provider.MediaStore.Audio.Media.TITLE, title)
+                        put(android.provider.MediaStore.Audio.Media.ARTIST, artist)
+                        put(android.provider.MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
+                        put(android.provider.MediaStore.Audio.Media.RELATIVE_PATH, "Music/JOY MUSIC")
+                        put(android.provider.MediaStore.Audio.Media.IS_PENDING, 1)
+                    }
+
+                    val resolver = context.contentResolver
+                    val uri = resolver.insert(android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, contentValues)
+                        ?: throw IOException("Failed to create MediaStore entry")
+
+                    resolver.openOutputStream(uri)?.use { out ->
+                        finalFile.inputStream().use { input ->
+                            input.copyTo(out)
+                        }
+                    }
+
+                    contentValues.clear()
+                    contentValues.put(android.provider.MediaStore.Audio.Media.IS_PENDING, 0)
+                    resolver.update(uri, contentValues, null, null)
+                    resultUri = uri
+                } else {
+                    val publicMusicDir = DownloadFolderHelper.getPublicMusicDownloadFolder(context)
+                    val targetFile = File(publicMusicDir, fileName)
+                    finalFile.copyTo(targetFile, overwrite = true)
+                    android.media.MediaScannerConnection.scanFile(
+                        context,
+                        arrayOf(targetFile.absolutePath),
+                        arrayOf("audio/mp4"),
+                        null
+                    )
+                    resultUri = android.net.Uri.fromFile(targetFile)
+                }
+
+                resultUri
+            } finally {
+                if (tempSourceFile.exists()) tempSourceFile.delete()
+                if (tempOutputFile.exists()) tempOutputFile.delete()
+            }
+        }
+    }
+}
