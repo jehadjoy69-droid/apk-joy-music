@@ -89,7 +89,7 @@ The compiled APK will be located at:
 ## 👨‍💻 Creator & Maintainer
 
 - **Lead Developer:** **Jehad Joy**  
-  GitHub: [@jehadjoy15-stack](https://github.com/jehadjoy15-stack)  
+  GitHub: [@jehadjoy69-droid](https://github.com/jehadjoy15-stack)  
   Website: [https://joymusic.site/](https://joymusic.site/)
 
 ---
